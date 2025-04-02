@@ -1,154 +1,141 @@
 import 'dart:async';
-import 'dart:io';
-import 'dart:convert'; // Needed for jsonEncode
-import 'package:dart_appwrite/dart_appwrite.dart';
+import 'dart:convert'; // For jsonDecode/jsonEncode
+import 'package:dart_appwrite/dart_appwrite.dart'; // Server-side SDK
 
-// Uses context.res.send() FOR ALL RESPONSES - TESTING STEP 3
-Future<dynamic> main(final context) async {
-  // --- Initialize Client ---
-  final String apiKey = Platform.environment['APPWRITE_API_KEY'] ?? '';
-  final String apiEndpoint = Platform.environment['APPWRITE_ENDPOINT'] ?? '';
-  final String projectId = Platform.environment['APPWRITE_FUNCTION_PROJECT_ID'] ?? '';
+/*
+  Input: Expected JSON payload in the request body
+  {
+      "userId": "USER_ID_TO_UPDATE"
+  }
 
-  final Map<String, String> jsonHeaders = {
-    'Content-Type': 'application/json; charset=utf-8'
-  };
+  Output:
+   - Success: 200 OK with JSON { "success": true, "message": "...", "user": { ...updated user object... } }
+   - Error:   400 Bad Request (Missing userId/Invalid JSON), 404 Not Found (User not found), 500 Internal Server Error
+*/
 
-  if (apiKey.isEmpty || apiEndpoint.isEmpty || projectId.isEmpty) {
-    context.error('Configuration Error: Missing API Key, Endpoint, or Project ID.');
-    final responseData = {
-      'success': false,
-      'error': 'Function is not configured correctly.'
-    };
-    final responseBody = jsonEncode(responseData);
-    context.log('Attempting response via send() [Config Error]: $responseBody');
-    return context.res.send(responseBody, statusCode: 500, headers: jsonHeaders);
+Future<void> main(RuntimeRequest req, RuntimeResponse res) async {
+  // --- 1. Setup Appwrite Client ---
+  // Ensure required environment variables are set in your function settings
+  final String? endpoint = req.variables['APPWRITE_ENDPOINT'];
+  final String? projectId = req.variables['APPWRITE_PROJECT_ID'];
+  final String? apiKey = req.variables['APPWRITE_API_KEY']; // IMPORTANT: Use a Server API Key
+
+  if (endpoint == null || projectId == null || apiKey == null) {
+    req.error(
+        'Missing required environment variables: APPWRITE_ENDPOINT, APPWRITE_PROJECT_ID, APPWRITE_API_KEY');
+    return res.json(
+      {'success': false, 'message': 'Function misconfiguration.'},
+      statusCode: 500,
+    );
   }
 
   final client = Client()
-      .setEndpoint(apiEndpoint)
+      .setEndpoint(endpoint)
       .setProject(projectId)
       .setKey(apiKey)
-      .setSelfSigned(status: true); // Keep if needed for self-hosting
+      .setSelfSigned(status: true); // Use only on dev instance with self-signed cert
 
   final users = Users(client);
 
-  // --- Parse Request Body ---
-  Map<String, dynamic> body;
-  String? userId;
-  String? action;
-  String requestBodyRaw = context.req.bodyRaw ?? '';
-
+  // --- 2. Parse Input ---
+  Map<String, dynamic> payload;
   try {
-    context.log('Raw request body received: $requestBodyRaw');
-    if (requestBodyRaw.isEmpty) {
-      context.log('Request body is empty.');
-      final responseData = {'success': false, 'error': 'Request body is empty'};
-      final responseBody = jsonEncode(responseData);
-      context.log('Attempting response via send() [Empty Body]: $responseBody');
-      return context.res.send(responseBody, statusCode: 400, headers: jsonHeaders);
+    // Handle empty body or potential non-string body
+    if (req.bodyRaw == null || req.bodyRaw.isEmpty) {
+       req.error('Request body is empty.');
+       return res.json(
+        {'success': false, 'message': 'Missing request body.'},
+        statusCode: 400,
+      );
     }
-    body = jsonDecode(requestBodyRaw);
-    context.log('Parsed request body: $body');
-
-    userId = body['userId'] as String?; // Add safety checks if needed
-    action = body['action'] as String?;
-
-    if (userId == null || userId.isEmpty) {
-      context.log('Missing or empty "userId".');
-      final responseData = {'success': false, 'error': 'Missing or empty "userId"'};
-      final responseBody = jsonEncode(responseData);
-      context.log('Attempting response via send() [Missing UserID]: $responseBody');
-      return context.res.send(responseBody, statusCode: 400, headers: jsonHeaders);
-    }
-    if (action == null || action != 'makeAdmin') {
-      context.log('Missing or invalid action. Received: $action');
-      final responseData = {'success': false, 'error': 'Missing or invalid action. Supported: "makeAdmin"'};
-      final responseBody = jsonEncode(responseData);
-      context.log('Attempting response via send() [Invalid Action]: $responseBody');
-      return context.res.send(responseBody, statusCode: 400, headers: jsonHeaders);
-    }
-
-  } catch (e, stackTrace) {
-    context.error('Failed to parse request body: $e\nStackTrace: $stackTrace');
-    final responseData = {'success': false, 'error': 'Invalid JSON format.', 'details': e.toString()};
-    final responseBody = jsonEncode(responseData);
-    context.log('Attempting response via send() [JSON Parse Error]: $responseBody');
-    return context.res.send(responseBody, statusCode: 400, headers: jsonHeaders);
+    payload = jsonDecode(req.bodyRaw);
+  } catch (e) {
+    req.error('Invalid JSON payload: ${e.toString()}');
+    return res.json(
+      {'success': false, 'message': 'Invalid JSON payload provided.'},
+      statusCode: 400,
+    );
   }
 
-  // --- Update User Labels ---
+  final String? userId = payload['userId'] as String?;
+
+  if (userId == null || userId.isEmpty) {
+    req.error('Missing userId in request payload.');
+    return res.json(
+      {'success': false, 'message': 'Missing required field: userId'},
+      statusCode: 400,
+    );
+  }
+
+  req.log("Attempting to add 'admin' label to user: $userId");
+
   try {
-    context.log('Fetching user details for $userId...');
+    // --- 3. Get Current User Data ---
     final user = await users.get(userId: userId);
-    context.log('Successfully fetched user details for $userId.');
 
-    final List<String> currentLabels = user.labels; // Assuming modern SDK
-    context.log('Current labels: $currentLabels');
+    // --- 4. Prepare New Labels ---
+    // Ensure currentLabels is a List<String>, handle null or empty
+    final List<String> currentLabels =
+        user.labels?.map((label) => label.toString()).toList() ?? [];
 
-    final Set<String> newLabelsSet = Set<String>.from(currentLabels);
-    bool alreadyAdmin = newLabelsSet.contains('admin');
+    const String adminLabel = 'admin';
 
-    if (alreadyAdmin) {
-      context.log('User $userId already has the "admin" label.');
-      final responseData = {
-        'success': true,
-        'message': 'User already has the admin label.',
-        'userId': userId,
-        'labels': currentLabels,
-      };
-      final responseBody = jsonEncode(responseData);
-      context.log('Attempting response via send() [Already Admin]: $responseBody');
-      return context.res.send(responseBody, statusCode: 200, headers: jsonHeaders); // Use 200 OK
+    if (currentLabels.contains(adminLabel)) {
+      req.log("User $userId already has the '$adminLabel' label.");
+      // Optionally return success here if no update is needed
+      // return res.json({
+      //   'success': true,
+      //   'message': 'User already has admin label.',
+      //   'user': user.toMap(), // Convert user model to map for JSON
+      // }, statusCode: 200);
     }
 
-    newLabelsSet.add('admin');
-    final List<String> updatedLabelsList = newLabelsSet.toList();
-    context.log('Prepared updated labels list: $updatedLabelsList');
+    // Use a Set to automatically handle duplicates if 'admin' was already there
+    final newLabelsSet = Set<String>.from(currentLabels);
+    newLabelsSet.add(adminLabel);
+    final List<String> newLabels = newLabelsSet.toList();
 
-    context.log('Attempting users.updateLabels for $userId...');
-    await users.updateLabels(userId: userId, labels: updatedLabelsList);
-    context.log('users.updateLabels call completed successfully for $userId.');
+    // --- 5. Update User Labels ---
+    final updatedUser = await users.updateLabels(
+      userId: userId,
+      labels: newLabels,
+    );
 
-    final responseData = {
+    req.log("Successfully added 'admin' label to user $userId.");
+    return res.json(
+      {
         'success': true,
-        'message': 'Admin label added successfully.',
-        'userId': userId,
-        'updatedLabels': updatedLabelsList,
-    };
-    final responseBody = jsonEncode(responseData);
-    context.log('Attempting response via send() [Success]: $responseBody');
-    return context.res.send(responseBody, statusCode: 200, headers: jsonHeaders); // Use 200 OK
+        'message': 'Admin label added successfully to user $userId.',
+        'user': updatedUser.toMap(), // Convert Appwrite model to Map for JSON response
+      },
+      statusCode: 200,
+    );
 
   } on AppwriteException catch (e) {
-    context.error('Appwrite Error updating labels for user $userId: [${e.code}] ${e.message} | Type: ${e.type} | Response: ${e.response}');
-
-    int statusCode = 500;
-    String errorMessage = 'Failed to update user labels due to Appwrite error.';
-
-    if (e.code == 404) { statusCode = 404; errorMessage = 'User not found with ID: $userId'; }
-    else if (e.code == 401) { statusCode = 401; errorMessage = 'API Key lacks permission to update user labels.'; }
-    else if (e.code == 400) { statusCode = 400; errorMessage = 'Bad request updating labels (check label format/content).'; }
-
-    final responseData = {
+    req.error('Appwrite Error for user $userId: [${e.code}] ${e.message}');
+    // Handle specific errors like User Not Found
+    if (e.code == 404) { // Check Appwrite's specific code for User Not Found
+      return res.json(
+        {'success': false, 'message': 'User with ID $userId not found.'},
+        statusCode: 404,
+      );
+    }
+    // General Appwrite error
+    return res.json(
+      {
         'success': false,
-        'error': errorMessage,
-        'details': e.message,
-        'code': e.code
-    };
-    final responseBody = jsonEncode(responseData);
-    context.log('Attempting response via send() [Appwrite Error]: $responseBody');
-    return context.res.send(responseBody, statusCode: statusCode, headers: jsonHeaders);
-
-  } catch (e, stackTrace) {
-    context.error('Generic unexpected error updating labels for user $userId: ${e.toString()}\nStackTrace: ${stackTrace}');
-    final responseData = {
-      'success': false,
-      'error': 'An unexpected internal server error occurred.',
-      'details': e.toString()
-    };
-    final responseBody = jsonEncode(responseData);
-    context.log('Attempting response via send() [Generic Error]: $responseBody');
-    return context.res.send(responseBody, statusCode: 500, headers: jsonHeaders);
+        'message': 'Failed to add admin label: ${e.message ?? 'Appwrite Error'}'
+      },
+      statusCode: e.code ?? 500, // Use Appwrite's status code if available
+    );
+  } catch (e) {
+    req.error('Unexpected error for user $userId: ${e.toString()}');
+    return res.json(
+      {
+        'success': false,
+        'message': 'Failed to add admin label due to an unexpected error.',
+      },
+      statusCode: 500, // Use 500 for unexpected server-side errors
+    );
   }
 }
